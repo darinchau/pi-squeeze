@@ -1,0 +1,27 @@
+{
+  "name": "pi-squeeze",
+  "version": "0.1.0",
+  "description": "Pi extension: summarize old tool outputs with a cheap model before each LLM call to cut input tokens.",
+  "type": "module",
+  "keywords": [
+    "pi-package",
+    "pi-extension"
+  ],
+  "license": "MIT",
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.ts"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "1.0.0",
+    "@types/node": "24.10.1",
+    "typescript": "5.9.3"
+  }
+}
