@@ -33,6 +33,10 @@ export interface SqueezeConfig {
 	maxSummaryTokens: number;
 	/** Compressor prompt: "squeeze" (terse, per tool output) or "pi" (pi's built-in compaction prompt). */
 	promptStyle: PromptStyle;
+	/** Compact when the (squeezed) prompt reaches this % of the main model's context window. 0 = off. */
+	compactAtPercent: number;
+	/** Run pi compactions (auto, /compact, /squeeze-compact) with the compressor model instead of the chat model. */
+	compactWithCompressor: boolean;
 }
 
 export const DEFAULT_CONFIG: SqueezeConfig = {
@@ -48,7 +52,35 @@ export const DEFAULT_CONFIG: SqueezeConfig = {
 	concurrency: 4,
 	maxSummaryTokens: 2048,
 	promptStyle: "squeeze",
+	compactAtPercent: 70,
+	compactWithCompressor: true,
 };
+
+/** Rough token estimate (chars / 4) of what a message list costs as LLM input. */
+export function estimateTokens(messages: MsgLike[]): number {
+	let chars = 0;
+	for (const m of messages) {
+		if (typeof m.content === "string") {
+			chars += m.content.length;
+			continue;
+		}
+		if (!Array.isArray(m.content)) continue;
+		for (const p of m.content as AnyPart[]) {
+			if (typeof p.text === "string") chars += p.text.length;
+			else if (typeof p.thinking === "string") chars += p.thinking.length;
+			else if (p.type === "toolCall") chars += JSON.stringify(p.arguments ?? {}).length;
+			else if (p.type === "image") chars += 4800; // ~1.2k tokens
+		}
+	}
+	return Math.ceil(chars / 4);
+}
+
+/** 1234 -> "1.2k", 2_500_000 -> "2.5M". */
+export function formatTokens(n: number): string {
+	if (n < 1000) return String(Math.round(n));
+	if (n < 1_000_000) return `${(n / 1000).toFixed(n < 10_000 ? 1 : 0)}k`;
+	return `${(n / 1_000_000).toFixed(n < 10_000_000 ? 2 : 1)}M`;
+}
 
 export function loadConfig(path: string): SqueezeConfig {
 	if (!existsSync(path)) return { ...DEFAULT_CONFIG };
@@ -134,12 +166,15 @@ export class SqueezeStore {
 	writeRaw(key: string, toolName: string, args: string, output: string): string {
 		const safeTool = toolName.replace(/[^a-zA-Z0-9_-]/g, "_");
 		const file = join(this.dir, `${safeTool}-${key}.txt`);
+		// The tmp dir can vanish mid-session (tmp cleaners, manual rm); recreate it.
+		mkdirSync(this.dir, { recursive: true });
 		writeFileSync(file, `# tool: ${toolName}\n# args: ${args}\n\n${output}`, "utf8");
 		return file;
 	}
 
 	set(key: string, rec: SummaryRecord): void {
 		this.cache[key] = rec;
+		mkdirSync(this.dir, { recursive: true });
 		writeFileSync(this.cachePath, JSON.stringify(this.cache), "utf8");
 	}
 

@@ -1,9 +1,9 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, readFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { compressorPrompt, compressorSystem, DEFAULT_CONFIG, type MsgLike, SqueezeStore, shouldSqueezeFor, squeezeMessages } from "../src/core.ts";
+import { compressorPrompt, compressorSystem, DEFAULT_CONFIG, estimateTokens, formatTokens, type MsgLike, SqueezeStore, shouldSqueezeFor, squeezeMessages } from "../src/core.ts";
 
 const big = (tag: string) => `${tag} `.repeat(1000); // ~4000+ chars
 
@@ -88,4 +88,26 @@ test("prompt styles", () => {
 	assert.match(compressorSystem("pi"), /context summarization assistant/);
 	assert.match(compressorPrompt(req, 100, "squeeze"), /<tool_output>\nOUT/);
 	assert.match(compressorSystem("squeeze"), /compress tool outputs/);
+});
+
+test("store survives its tmp dir being deleted mid-session", () => {
+	const dir = join(mkdtempSync(join(tmpdir(), "sq-")), "session");
+	const store = new SqueezeStore(dir);
+	rmSync(dir, { recursive: true, force: true });
+	const file = store.writeRaw("k1", "read", JSON.stringify({ path: "a" }), "hello");
+	store.set("k1", { summary: "s", file, originalChars: 5 } as never);
+	assert.ok(existsSync(file));
+	assert.ok(existsSync(join(dir, "summaries.json")));
+});
+
+test("estimateTokens / formatTokens", () => {
+	const msgs: MsgLike[] = [
+		{ role: "user", content: "x".repeat(400) },
+		{ role: "assistant", content: [{ type: "text", text: "y".repeat(400) }, { type: "toolCall", arguments: { a: 1 } }] },
+	];
+	assert.equal(estimateTokens(msgs), Math.ceil((800 + 7) / 4));
+	assert.equal(formatTokens(950), "950");
+	assert.equal(formatTokens(1234), "1.2k");
+	assert.equal(formatTokens(123_456), "123k");
+	assert.equal(formatTokens(2_500_000), "2.50M");
 });

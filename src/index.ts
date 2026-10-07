@@ -2,12 +2,20 @@
  * pi-squeeze: before each LLM call, replace older large tool outputs with summaries written by a
  * cheap "compressor" model. Originals are kept in tmp files so the agent can rg/read them.
  *
- * Commands: /squeeze [status|on|off|model|targets|style|set <key> <value>]
+ * Also: pi compactions (auto, /compact, /squeeze-compact) are summarized by the compressor model,
+ * and a compaction is triggered when the squeezed prompt reaches compactAtPercent of the context window.
+ *
+ * Commands: /squeeze [status|on|off|model|targets|style|set <key> <value>], /squeeze-compact [instructions]
  */
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+// Host-provided at runtime (peer dependency); pi's own compaction routine, reused with another model.
+import { compact as piCompact } from "@earendil-works/pi-coding-agent";
 import {
+	estimateTokens,
+	formatTokens,
 	compressorPrompt,
 	compressorSystem,
 	PROMPT_STYLES,
@@ -31,6 +39,12 @@ export default function (pi: ExtensionAPI) {
 	let storeSession = "";
 	let lastReport = "";
 	const totals = { calls: 0, charsSaved: 0, summarized: 0, errors: 0 };
+	// Cumulative main-model input tokens avoided this session (squeezing every call + compactions run on the compressor).
+	let saved = { squeeze: 0, compaction: 0 };
+	let savedPath = "";
+	// Estimated main-model prompt size after the latest squeeze; null until measured after a compaction.
+	let lastPromptTokens: number | null = null;
+	let compacting = false;
 
 	const persist = () => saveConfig(configPath(), config);
 	const modelKey = (m: { provider: string; id: string } | undefined) => (m ? `${m.provider}/${m.id}` : undefined);
@@ -40,16 +54,61 @@ export default function (pi: ExtensionAPI) {
 		if (!store || storeSession !== sid) {
 			store = new SqueezeStore(join(tmpdir(), "pi-squeeze", sid));
 			storeSession = sid;
+			savedPath = join(store.dir, "saved.json");
+			saved = { squeeze: 0, compaction: 0 };
+			try {
+				if (existsSync(savedPath)) saved = { ...saved, ...JSON.parse(readFileSync(savedPath, "utf8")) };
+			} catch {
+				/* start from zero */
+			}
 		}
 		return store;
+	}
+
+	function persistSaved() {
+		if (!store || !savedPath) return;
+		try {
+			mkdirSync(store.dir, { recursive: true });
+			writeFileSync(savedPath, JSON.stringify(saved), "utf8");
+		} catch {
+			/* stats are best-effort */
+		}
 	}
 
 	function updateStatus(ctx: ExtensionContext) {
 		if (!ctx.hasUI) return;
 		if (!config.enabled) return ctx.ui.setStatus("pi-squeeze", undefined);
 		const label = config.compressorModel ? `squeeze:${config.compressorModel.split("/").pop()}` : "squeeze:no-model";
-		const saved = totals.charsSaved > 0 ? ` -${Math.round(totals.charsSaved / 4 / 1000)}k tok/call` : "";
-		ctx.ui.setStatus("pi-squeeze", label + saved);
+		const total = saved.squeeze + saved.compaction;
+		const savedText = total > 0 ? ` ▼${formatTokens(total)} tok saved` : "";
+		const ctxText = lastPromptTokens !== null && ctx.model?.contextWindow
+			? ` ${Math.round((lastPromptTokens / ctx.model.contextWindow) * 100)}%`
+			: "";
+		ctx.ui.setStatus("pi-squeeze", label + savedText + ctxText);
+	}
+
+	function compressorUsable(ctx: ExtensionContext) {
+		if (!config.enabled || !config.compactWithCompressor || !config.compressorModel) return undefined;
+		const m = resolveCompressor(ctx);
+		if (!m || modelKey(m)?.toLowerCase() === modelKey(ctx.model)?.toLowerCase()) return undefined;
+		return m;
+	}
+
+	function triggerCompact(ctx: ExtensionContext, why: string, customInstructions?: string) {
+		if (compacting) return;
+		compacting = true;
+		if (ctx.hasUI) ctx.ui.notify(`pi-squeeze: compacting (${why})`, "info");
+		ctx.compact({
+			customInstructions,
+			onComplete: () => {
+				compacting = false;
+				updateStatus(ctx);
+			},
+			onError: (err) => {
+				compacting = false;
+				if (ctx.hasUI) ctx.ui.notify(`pi-squeeze: compaction failed: ${err.message}`, "error");
+			},
+		});
 	}
 
 	function resolveCompressor(ctx: ExtensionContext) {
@@ -59,7 +118,70 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("session_start", async (_e, ctx) => {
 		config = loadConfig(configPath());
+		lastPromptTokens = null;
+		getStore(ctx);
 		updateStatus(ctx);
+	});
+
+	// Run pi's compaction (same prompts, split-turn and file-list handling) but on the compressor model.
+	pi.on("session_before_compact", async (event, ctx) => {
+		const model = compressorUsable(ctx);
+		if (!model) return;
+		const { preparation, customInstructions, signal } = event;
+		try {
+			const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
+			if (!auth.ok) throw new Error(auth.error);
+			const result = await piCompact(
+				preparation,
+				model,
+				auth.apiKey,
+				auth.headers
+					? Object.fromEntries(
+							Object.entries(auth.headers).filter((e): e is [string, string] => typeof e[1] === "string"),
+						)
+					: undefined,
+				customInstructions,
+				signal,
+				undefined,
+				// Route through the registry so request-time auth (OAuth, custom providers) applies.
+				(m, context, options) => ctx.modelRegistry.streamSimple(m, context, options),
+			);
+			if (!result.summary.trim()) throw new Error("empty summary");
+			// The chat model would have read the whole history to write this summary.
+			getStore(ctx);
+			saved.compaction += preparation.tokensBefore;
+			persistSaved();
+			if (ctx.hasUI) {
+				ctx.ui.notify(
+					`pi-squeeze: compacted ${formatTokens(preparation.tokensBefore)} tokens with ${modelKey(model)} (${event.reason})`,
+					"info",
+				);
+			}
+			return { compaction: result };
+		} catch (error) {
+			if (signal.aborted) return;
+			const msg = error instanceof Error ? error.message : String(error);
+			// Fall back to pi's default compaction with the chat model.
+			if (ctx.hasUI) ctx.ui.notify(`pi-squeeze: compressor compaction failed (${msg}); using default`, "warning");
+			return;
+		}
+	});
+
+	pi.on("session_compact", async (_e, ctx) => {
+		lastPromptTokens = null; // re-measure on the next call
+		updateStatus(ctx);
+	});
+
+	// Threshold check at idle: ctx.compact() aborts a running turn, so never fire mid-run.
+	// (Mid-run, pi's own threshold/overflow compaction still runs, on the compressor via the hook above.)
+	pi.on("agent_settled", async (_e, ctx) => {
+		if (!config.enabled || config.compactAtPercent <= 0 || lastPromptTokens === null) return;
+		const window = ctx.model?.contextWindow;
+		if (!window) return;
+		const pct = (lastPromptTokens / window) * 100;
+		if (pct < config.compactAtPercent) return;
+		lastPromptTokens = null; // loop guard: needs a fresh measurement before triggering again
+		triggerCompact(ctx, `prompt ~${Math.round(pct)}% of ${formatTokens(window)} >= ${config.compactAtPercent}%`);
 	});
 
 	pi.on("context", async (event, ctx) => {
@@ -102,6 +224,9 @@ export default function (pi: ExtensionAPI) {
 
 		totals.calls++;
 		totals.charsSaved = result.charsSaved; // savings on the latest call
+		saved.squeeze += Math.round(result.charsSaved / 4);
+		if (result.charsSaved > 0) persistSaved();
+		lastPromptTokens = estimateTokens(result.messages) + Math.ceil(ctx.getSystemPrompt().length / 4);
 		totals.summarized += result.newlySummarized;
 		totals.errors += result.errors.length;
 		lastReport = `last call: ${result.squeezed} outputs squeezed, ~${Math.round(result.charsSaved / 4)} tokens saved, ${result.newlySummarized} new summaries`;
@@ -166,12 +291,24 @@ export default function (pi: ExtensionAPI) {
 			`active model: ${modelKey(ctx.model) ?? "?"} -> ${shouldSqueezeFor(config, modelKey(ctx.model)) ? "squeezing" : "not squeezing"}`,
 			`keepFirst=${config.keepFirstToolTurns} keepRecent=${config.keepRecentToolTurns} minChars=${config.minChars} summaryWords=${config.summaryWords}`,
 			lastReport || "no calls yet",
+			`compaction: ${config.compactWithCompressor ? "via compressor" : "via chat model"}, auto at ${config.compactAtPercent > 0 ? `${config.compactAtPercent}%` : "off"}${lastPromptTokens !== null && ctx.model?.contextWindow ? ` (now ~${formatTokens(lastPromptTokens)} / ${formatTokens(ctx.model.contextWindow)})` : ""}`,
+			`saved this session: ~${formatTokens(saved.squeeze + saved.compaction)} tokens (squeeze ${formatTokens(saved.squeeze)}, compaction ${formatTokens(saved.compaction)})`,
 			s ? `session cache: ${s.count} summaries, ${s.originalChars} -> ${s.summaryChars} chars, dir ${store?.dir}` : "",
 			`config: ${configPath()}`,
 		]
 			.filter(Boolean)
 			.join("\n");
 	}
+
+	pi.registerCommand("squeeze-compact", {
+		description: "Compact the context now, summarized by the pi-squeeze compressor model: /squeeze-compact [instructions]",
+		handler: async (args, ctx) => {
+			if (!compressorUsable(ctx)) {
+				ctx.ui.notify("pi-squeeze: compressor unavailable (off, not set, or same as chat model); using default compaction", "warning");
+			}
+			triggerCompact(ctx, "manual", (args ?? "").trim() || undefined);
+		},
+	});
 
 	pi.registerCommand("squeeze", {
 		description: "Summarize old tool outputs with a cheap model: /squeeze [status|on|off|model|targets|style|set <key> <value>]",

@@ -10,6 +10,8 @@ A pi extension that cuts the input tokens sent to an expensive model. Before eve
 - There are two compressor prompt styles, switched with `/squeeze style`. `squeeze` (default) writes a terse summary of each output. `pi` reuses pi's built-in compaction prompt verbatim (a structured Goal/Progress/Next Steps checkpoint).
 - If a summary isn't meaningfully shorter than the original (`maxRatio`), the original is kept.
 - Compressor errors never block a turn. The affected output is just sent unsqueezed.
+- Compaction runs on the compressor too. Every pi compaction (auto, `/compact`, `/squeeze-compact`) uses pi's own `compact()` routine with the compressor model instead of the chat model. That covers the same prompts, split-turn and file-list handling. If the compressor fails, pi's default compaction runs.
+- Once the squeezed prompt reaches `compactAtPercent` of the chat model's context window, a compaction is triggered when the agent goes idle. It never fires mid-run, because `ctx.compact()` aborts the turn.
 
 ## Install
 
@@ -45,8 +47,9 @@ The commands work in the TUI and in pi web, which forwards the select/input dial
 | `/squeeze targets` | Only squeeze when the active model matches these patterns, e.g. `Yunqiao/*` |
 | `/squeeze set <key> <value>` | Change any config key |
 | `/squeeze status` | Print status |
+| `/squeeze-compact [instructions]` | Compact now with the compressor model |
 
-The footer shows `squeeze:<model> -Nk tok/call` while it's active.
+The footer shows `squeeze:<model> ▼<N> tok saved <P>%`. N is the main-model input tokens avoided this session, counting squeezing on every call plus the history each compaction would have fed the chat model. P is the squeezed prompt size as a percentage of the context window.
 
 ## Config
 
@@ -66,6 +69,8 @@ Config lives in `~/.pi/agent/pi-squeeze.json`. You can override the path with `P
 | `concurrency` | `4` | Parallel compressor calls |
 | `maxSummaryTokens` | `2048` | Output cap per summary |
 | `promptStyle` | `squeeze` | `squeeze` or `pi` |
+| `compactAtPercent` | `70` | Auto-compact when the squeezed prompt reaches this % of the context window. `0` turns it off. |
+| `compactWithCompressor` | `true` | Run compactions on the compressor model |
 
 ## Trade-offs
 
