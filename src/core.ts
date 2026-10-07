@@ -27,6 +27,23 @@ export interface SqueezeConfig {
 	maxRatio: number;
 	/** Characters of tool output sent to the compressor at most (head + tail kept). */
 	maxCompressorInputChars: number;
+	/**
+	 * Soft target for estimated input tokens sent to the main model (messages + system prompt).
+	 * Compression is applied oldest-first only until the estimate is under this target.
+	 * 0 = compress everything eligible (smallest possible context).
+	 */
+	contextTarget: number;
+	/** Once over `contextTarget`, compress down to this fraction of it (headroom for following turns). */
+	targetLowRatio: number;
+	/** Max consecutive tool-calling steps collapsed into one block summary. */
+	maxBlockSteps: number;
+	/** Soft length target for block summaries, in words. */
+	blockSummaryWords: number;
+	/**
+	 * Characters of surrounding (uncompressed) session transcript given to the compressor as context.
+	 * The compressor is cheap, so it sees the whole session; this transcript is a shared, cacheable prefix.
+	 */
+	compressorContextChars: number;
 	/** Parallel compressor calls. */
 	concurrency: number;
 	/** Max output tokens for one summary call. */
@@ -49,6 +66,11 @@ export const DEFAULT_CONFIG: SqueezeConfig = {
 	summaryWords: 200,
 	maxRatio: 0.6,
 	maxCompressorInputChars: 400_000,
+	contextTarget: 0,
+	targetLowRatio: 0.7,
+	maxBlockSteps: 10,
+	blockSummaryWords: 350,
+	compressorContextChars: 300_000,
 	concurrency: 4,
 	maxSummaryTokens: 2048,
 	promptStyle: "squeeze",
@@ -128,11 +150,13 @@ export interface SummaryRecord {
 	originalChars: number;
 }
 
+/** One compressor call. `system` carries the shared session transcript (identical across calls in one pass, so it caches). */
 export interface SummarizeRequest {
-	toolName: string;
-	toolArgs: string;
-	output: string;
-	userGoal: string;
+	kind: "output" | "block";
+	/** Human-readable label, e.g. "bash" or "steps S3–S9". */
+	label: string;
+	system: string;
+	prompt: string;
 }
 
 export type Summarizer = (req: SummarizeRequest) => Promise<string>;
@@ -169,6 +193,14 @@ export class SqueezeStore {
 		// The tmp dir can vanish mid-session (tmp cleaners, manual rm); recreate it.
 		mkdirSync(this.dir, { recursive: true });
 		writeFileSync(file, `# tool: ${toolName}\n# args: ${args}\n\n${output}`, "utf8");
+		return file;
+	}
+
+	/** Raw transcript of a collapsed block of steps. */
+	writeBlock(key: string, label: string, transcript: string): string {
+		const file = join(this.dir, `block-${key}.txt`);
+		mkdirSync(this.dir, { recursive: true });
+		writeFileSync(file, `# pi-squeeze collapsed block: ${label}\n\n${transcript}`, "utf8");
 		return file;
 	}
 
@@ -232,14 +264,217 @@ async function mapLimit<T>(items: T[], limit: number, fn: (t: T) => Promise<void
 
 export interface SqueezeResult {
 	messages: MsgLike[];
+	/** Tool outputs replaced by per-output summaries. */
 	squeezed: number;
+	/** Blocks of steps collapsed into a single summary. */
+	blocks: number;
+	/** Messages removed by block collapsing (net). */
+	messagesRemoved: number;
 	newlySummarized: number;
 	charsSaved: number;
+	/** Estimated tokens of the returned messages (excl. system prompt). */
+	tokensAfter: number;
 	errors: string[];
 }
 
+// ---------------------------------------------------------------------------
+// Algorithm overview
+//
+// 1. Segment the transcript into "steps": an assistant message that makes tool calls plus the
+//    tool results answering it. Everything else (user, system, custom, compaction summaries,
+//    assistant messages without tool calls) is a protected barrier and is never touched.
+// 2. Protect the first `keepFirstToolTurns` and last `keepRecentToolTurns` steps, plus steps
+//    that are still unresolved (missing results).
+// 3. Group remaining consecutive steps (no barrier in between) into runs, then chunk each run
+//    into blocks of at most `maxBlockSteps`. Chunk boundaries are fixed per run (anchored at the
+//    run start), so block identity, and therefore the summary cache, is stable as the session grows.
+// 4. Compression levels, cheapest first:
+//      L1: replace a large tool output with a summary (old behaviour)
+//      L2: replace a whole block of steps (assistant text, tool calls, results) with one summary
+//    Apply oldest-first until the estimated context is under `contextTarget` (0 = all the way).
+//    A block of a single step is only squeezed at L1; L2 needs >= 2 steps.
+// 5. Compressor calls share one system prompt containing the full uncompressed session transcript
+//    (cheap model, cacheable prefix), so summaries are written with whole-session awareness.
+// ---------------------------------------------------------------------------
+
+interface ToolCallInfo {
+	id: string;
+	name: string;
+	args: string;
+}
+
+interface Step {
+	/** Index of the assistant message in `messages`. */
+	aIdx: number;
+	/** Indices of the tool results belonging to this step. */
+	resultIdx: number[];
+	calls: ToolCallInfo[];
+	complete: boolean;
+}
+
+interface Block {
+	steps: Step[];
+	/** First/last message index covered (assistant .. last result). */
+	from: number;
+	to: number;
+	/** Step ordinal (1-based) for labels. */
+	firstOrdinal: number;
+}
+
+function toolCallsOf(m: MsgLike): ToolCallInfo[] {
+	if (m.role !== "assistant" || !Array.isArray(m.content)) return [];
+	const out: ToolCallInfo[] = [];
+	for (const p of m.content as AnyPart[]) {
+		if (p.type === "toolCall" && typeof p.id === "string") {
+			out.push({ id: p.id, name: String(p.name ?? "tool"), args: JSON.stringify(p.arguments ?? {}) });
+		}
+	}
+	return out;
+}
+
+/** Split messages into tool steps. Messages between steps are barriers. */
+function segmentSteps(messages: MsgLike[]): { steps: Step[]; barrierBefore: boolean[] } {
+	const steps: Step[] = [];
+	const barrierBefore: boolean[] = []; // barrierBefore[k]: a protected message sits between step k-1 and k
+	let sawBarrier = false;
+	let i = 0;
+	while (i < messages.length) {
+		const m = messages[i];
+		const calls = toolCallsOf(m);
+		if (calls.length === 0) {
+			sawBarrier = true;
+			i++;
+			continue;
+		}
+		const ids = new Set(calls.map((c) => c.id));
+		const resultIdx: number[] = [];
+		let j = i + 1;
+		while (j < messages.length && messages[j].role === "toolResult" && ids.has(String(messages[j].toolCallId))) {
+			resultIdx.push(j);
+			j++;
+		}
+		barrierBefore.push(sawBarrier || steps.length === 0);
+		steps.push({ aIdx: i, resultIdx, calls, complete: resultIdx.length === calls.length });
+		sawBarrier = false;
+		i = j;
+	}
+	return { steps, barrierBefore };
+}
+
+function buildBlocks(steps: Step[], barrierBefore: boolean[], config: SqueezeConfig): Block[] {
+	const n = steps.length;
+	const lo = Math.max(0, config.keepFirstToolTurns);
+	const hi = n - Math.max(0, config.keepRecentToolTurns);
+	const blocks: Block[] = [];
+	const size = Math.max(1, config.maxBlockSteps);
+	let run: number[] = [];
+	const flush = () => {
+		for (let s = 0; s < run.length; s += size) {
+			const ks = run.slice(s, s + size);
+			const st = ks.map((k) => steps[k]);
+			const last = st[st.length - 1];
+			blocks.push({
+				steps: st,
+				from: st[0].aIdx,
+				to: last.resultIdx.length ? last.resultIdx[last.resultIdx.length - 1] : last.aIdx,
+				firstOrdinal: ks[0] + 1,
+			});
+		}
+		run = [];
+	};
+	for (let k = 0; k < n; k++) {
+		const eligible = k >= lo && k < hi && steps[k].complete;
+		if (!eligible || barrierBefore[k]) flush();
+		if (eligible) run.push(k);
+	}
+	flush();
+	return blocks;
+}
+
+/** Plain-text rendering of messages for the compressor (and for raw block files). */
+export function renderTranscript(messages: MsgLike[], from = 0, to = messages.length - 1, outputCap = Infinity): string {
+	const lines: string[] = [];
+	for (let i = from; i <= to && i < messages.length; i++) {
+		const m = messages[i];
+		if (m.role === "toolResult") {
+			const t = textOf(m.content);
+			lines.push(`[Tool result ${m.toolName ?? "tool"}${m.isError ? " (error)" : ""}]:\n${clip(t, outputCap)}`);
+			continue;
+		}
+		if (m.role === "assistant" && Array.isArray(m.content)) {
+			const parts: string[] = [];
+			for (const p of m.content as AnyPart[]) {
+				if (p.type === "text" && typeof p.text === "string" && p.text.trim()) parts.push(p.text);
+				else if (p.type === "toolCall") parts.push(`<tool call> ${String(p.name)}(${piArgs(JSON.stringify(p.arguments ?? {}))})`);
+			}
+			if (parts.length) lines.push(`[Assistant]:\n${parts.join("\n")}`);
+			continue;
+		}
+		const body = typeof m.summary === "string" ? m.summary : textOf(m.content);
+		if (body) lines.push(`[${m.role === "user" ? "User" : m.role}]:\n${body}`);
+	}
+	return lines.join("\n\n");
+}
+
 /**
- * Replace older, large tool results with summaries. Returns a new array; input is not mutated.
+ * Session context for the compressor: the full uncompressed transcript, capped at `maxChars`.
+ * When over budget, each tool output is clipped to an equal share (head + tail); user and
+ * assistant text are always included in full. As a last resort the middle is dropped.
+ */
+export function sessionContext(messages: MsgLike[], maxChars: number): string {
+	if (maxChars <= 0) return "";
+	let full = renderTranscript(messages);
+	if (full.length <= maxChars) return full;
+	const outputs = messages.filter((m) => m.role === "toolResult").length || 1;
+	let cap = Math.floor(maxChars / outputs);
+	for (let tries = 0; tries < 6 && cap > 200; tries++) {
+		full = renderTranscript(messages, 0, messages.length - 1, cap);
+		if (full.length <= maxChars) return full;
+		cap = Math.floor(cap / 2);
+	}
+	return clip(full, maxChars);
+}
+
+function blockKey(messages: MsgLike[], b: Block): string {
+	const h = createHash("sha256");
+	for (let i = b.from; i <= b.to; i++) {
+		const m = messages[i];
+		h.update(m.role + "\0" + String(m.toolCallId ?? "") + "\0");
+		h.update(m.role === "assistant" ? JSON.stringify(m.content) : textOf(m.content));
+		h.update("\u0001");
+	}
+	return "b" + h.digest("hex").slice(0, 16);
+}
+
+function blockLabel(b: Block): string {
+	const a = b.firstOrdinal;
+	const z = a + b.steps.length - 1;
+	return a === z ? `step S${a}` : `steps S${a}-S${z}`;
+}
+
+function blockMessage(rec: SummaryRecord, b: Block, original: MsgLike): MsgLike {
+	const tools = new Map<string, number>();
+	for (const s of b.steps) for (const c of s.calls) tools.set(c.name, (tools.get(c.name) ?? 0) + 1);
+	const toolList = [...tools].map(([n, c]) => (c > 1 ? `${n}x${c}` : n)).join(", ");
+	const text = [
+		`[pi-squeeze: ${blockLabel(b)} (${b.steps.length} tool-calling steps: ${toolList}; ${rec.originalChars} chars) were collapsed into this summary by a smaller model.`,
+		`Full original transcript: ${rec.file}`,
+		`Use rg / read on that file if you need exact details.]`,
+		"",
+		rec.summary,
+	].join("\n");
+	// Keep provider/model metadata of the original assistant message; drop tool calls.
+	const { content: _c, ...meta } = original;
+	return { ...meta, stopReason: "stop", content: [{ type: "text", text }] };
+}
+
+function tokensOf(m: MsgLike): number {
+	return estimateTokens([m]);
+}
+
+/**
+ * Compress older steps until the context fits `contextTarget`. Returns a new array; input is not mutated.
+ * `systemTokens` is added to the message estimate when comparing against the target.
  */
 export async function squeezeMessages(
 	messages: MsgLike[],
@@ -247,96 +482,209 @@ export async function squeezeMessages(
 	store: SqueezeStore,
 	summarize: Summarizer,
 	signal?: AbortSignal,
+	systemTokens = 0,
 ): Promise<SqueezeResult> {
-	const result: SqueezeResult = { messages, squeezed: 0, newlySummarized: 0, charsSaved: 0, errors: [] };
+	const result: SqueezeResult = {
+		messages,
+		squeezed: 0,
+		blocks: 0,
+		messagesRemoved: 0,
+		newlySummarized: 0,
+		charsSaved: 0,
+		tokensAfter: 0,
+		errors: [],
+	};
+	const msgTokens = messages.map(tokensOf);
+	let total = msgTokens.reduce((a, b) => a + b, 0) + systemTokens;
+	// Hysteresis: new compression only starts when over `contextTarget`, then continues down to
+	// `contextTarget * targetLowRatio`. Undershooting leaves headroom so the next turns reuse cached
+	// summaries (no compressor calls, stable prompt prefix for the main model's cache).
+	const target = Math.max(0, config.contextTarget);
+	const low = target * Math.min(1, Math.max(0, config.targetLowRatio));
+	const triggered = target === 0 || total > target;
+	const overTarget = () => target === 0 || (triggered && total > low);
 
-	// Map toolCallId -> args, and find which assistant-turns are "recent".
-	const toolArgs = new Map<string, string>();
-	const toolCallOwner = new Map<string, number>(); // toolCallId -> assistant msg index
-	const toolAssistantIdx: number[] = [];
-	messages.forEach((m, idx) => {
-		if (m.role !== "assistant" || !Array.isArray(m.content)) return;
-		let hasCall = false;
-		for (const p of m.content as AnyPart[]) {
-			if (p.type === "toolCall" && typeof p.id === "string") {
-				hasCall = true;
-				toolArgs.set(p.id, JSON.stringify(p.arguments ?? {}));
-				toolCallOwner.set(p.id, idx);
-			}
-		}
-		if (hasCall) toolAssistantIdx.push(idx);
-	});
-	const keep = Math.max(0, config.keepRecentToolTurns);
-	const cutoffAssistantIdx =
-		toolAssistantIdx.length > keep ? toolAssistantIdx[toolAssistantIdx.length - keep - 1] : -1;
-	const firstKeep = Math.max(0, config.keepFirstToolTurns);
-	const protectedFirst = new Set(toolAssistantIdx.slice(0, firstKeep));
-
-	// Last user message text, used as relevance hint for the compressor.
-	let userGoal = "";
-	for (let i = messages.length - 1; i >= 0; i--) {
-		if (messages[i].role === "user") {
-			userGoal = clip(textOf(messages[i].content), 3000);
-			break;
-		}
+	const { steps, barrierBefore } = segmentSteps(messages);
+	const blocks = buildBlocks(steps, barrierBefore, config);
+	if (blocks.length === 0) {
+		result.tokensAfter = total - systemTokens;
+		return result;
 	}
 
-	type Job = { idx: number; key: string; text: string; toolName: string; args: string };
-	const jobs: Job[] = [];
-	const ready = new Map<number, SummaryRecord>();
+	// Shared compressor context: whole uncompressed session, built lazily (only if a call is needed).
+	let system: string | undefined;
+	const systemFor = (style: PromptStyle) => {
+		system ??= compressorSystem(style) + sessionSection(sessionContext(messages, config.compressorContextChars));
+		return system;
+	};
+	const userGoal = clip(latestUserText(messages), 3000);
 
-	messages.forEach((m, idx) => {
-		if (m.role !== "toolResult" || !m.toolCallId) return;
-		const owner = toolCallOwner.get(m.toolCallId);
-		// Only tool results are ever rewritten: system prompt, user and assistant messages pass through untouched.
-		if (owner === undefined || owner > cutoffAssistantIdx) return; // recent: keep verbatim
-		if (protectedFirst.has(owner)) return; // first turn(s): keep verbatim
-		const text = textOf(m.content);
-		if (text.length < config.minChars) return;
-		if (text.startsWith("[pi-squeeze:")) return;
-		const key = hashKey(m.toolCallId, text);
+	const replaced = new Map<number, MsgLike>(); // message index -> replacement
+	const removed = new Set<number>();
+
+	// ---- Level 1: per-output summaries, oldest first ----
+	interface OutJob {
+		idx: number;
+		key: string;
+		text: string;
+		toolName: string;
+		args: string;
+	}
+	const argsById = new Map<string, string>();
+	for (const s of steps) for (const c of s.calls) argsById.set(c.id, c.args);
+	const l1Candidates = (b: Block): OutJob[] => {
+		const out: OutJob[] = [];
+		for (const s of b.steps) {
+			for (const idx of s.resultIdx) {
+				const m = messages[idx];
+				const text = textOf(m.content);
+				if (text.length < config.minChars || text.startsWith("[pi-squeeze:")) continue;
+				out.push({
+					idx,
+					key: hashKey(String(m.toolCallId), text),
+					text,
+					toolName: String(m.toolName ?? "tool"),
+					args: argsById.get(String(m.toolCallId)) ?? "{}",
+				});
+			}
+		}
+		return out;
+	};
+	const applyL1 = (job: OutJob, rec: SummaryRecord) => {
+		if (!rec.summary) return;
+		const m = messages[job.idx];
+		const parts = Array.isArray(m.content) ? (m.content as AnyPart[]) : [{ type: "text", text: String(m.content ?? "") }];
+		const nonText = parts.filter((p) => p.type !== "text");
+		const next: MsgLike = { ...m, content: [{ type: "text", text: placeholder(rec, job.toolName) } as TextPart, ...nonText] };
+		const before = msgTokens[job.idx];
+		const after = tokensOf(next);
+		replaced.set(job.idx, next);
+		msgTokens[job.idx] = after;
+		total += after - before;
+		result.charsSaved += Math.max(0, rec.originalChars - rec.summary.length);
+		result.squeezed++;
+	};
+	const runL1 = async (jobs: OutJob[]) => {
+		const todo: OutJob[] = [];
+		for (const j of jobs) {
+			const rec = store.get(j.key);
+			if (rec) applyL1(j, rec);
+			else todo.push(j);
+		}
+		await mapLimit(todo, config.concurrency, async (job) => {
+			if (signal?.aborted) return;
+			try {
+				const summary = (
+					await summarize({
+						kind: "output",
+						label: job.toolName,
+						system: systemFor(config.promptStyle),
+						prompt: outputPrompt(job, userGoal, config),
+					})
+				).trim();
+				const file = store.writeRaw(job.key, job.toolName, job.args, job.text);
+				const worth = summary.length > 0 && summary.length <= job.text.length * config.maxRatio;
+				const rec: SummaryRecord = { summary: worth ? summary : "", file, originalChars: job.text.length };
+				store.set(job.key, rec);
+				result.newlySummarized++;
+				applyL1(job, rec);
+			} catch (e) {
+				result.errors.push(`${job.toolName}: ${e instanceof Error ? e.message : String(e)}`);
+			}
+		});
+	};
+
+	// Level 1, oldest first. Cached summaries are always applied: they're free, and they keep the
+	// main model's prompt prefix stable. New ones run in windows of `concurrency` until under target.
+	const allJobs = blocks.flatMap(l1Candidates);
+	const uncached: OutJob[] = [];
+	for (const j of allJobs) {
+		const rec = store.get(j.key);
+		if (rec) applyL1(j, rec);
+		else uncached.push(j);
+	}
+	const win = Math.max(1, config.concurrency);
+	for (let s = 0; s < uncached.length && overTarget() && !signal?.aborted; s += win) {
+		await runL1(uncached.slice(s, s + win));
+	}
+
+	// ---- Level 2: collapse whole blocks, oldest first ----
+	const applyL2 = (b: Block, rec: SummaryRecord) => {
+		if (!rec.summary) return;
+		let before = 0;
+		for (let i = b.from; i <= b.to; i++) before += msgTokens[i];
+		const msg = blockMessage(rec, b, messages[b.from]);
+		const after = tokensOf(msg);
+		if (after >= before) return;
+		for (let i = b.from; i <= b.to; i++) {
+			if (replaced.has(i)) {
+				const r = replaced.get(i)!;
+				if (r.role === "toolResult") result.squeezed--; // L1 superseded by L2
+				replaced.delete(i);
+			}
+			if (i === b.from) continue;
+			removed.add(i);
+			msgTokens[i] = 0;
+		}
+		replaced.set(b.from, msg);
+		msgTokens[b.from] = after;
+		total += after - before;
+		result.charsSaved += Math.max(0, rec.originalChars - rec.summary.length);
+		result.messagesRemoved += b.to - b.from;
+		result.blocks++;
+	};
+
+	const l2 = blocks.filter((b) => b.steps.length >= 2);
+	for (const b of l2) {
+		const key = blockKey(messages, b);
 		const cached = store.get(key);
-		if (cached) ready.set(idx, cached);
-		else jobs.push({ idx, key, text, toolName: m.toolName ?? "tool", args: toolArgs.get(m.toolCallId) ?? "{}" });
-	});
-
-	await mapLimit(jobs, config.concurrency, async (job) => {
-		if (signal?.aborted) return;
+		if (cached) {
+			// Always reuse cached block summaries (stable prefix for the main model).
+			applyL2(b, cached);
+			continue;
+		}
+		if (!overTarget()) continue;
+		if (signal?.aborted) break;
+		const transcript = renderTranscript(messages, b.from, b.to);
 		try {
 			const summary = (
 				await summarize({
-					toolName: job.toolName,
-					toolArgs: clip(job.args, 4000),
-					output: clip(job.text, config.maxCompressorInputChars),
-					userGoal,
+					kind: "block",
+					label: blockLabel(b),
+					system: systemFor(config.promptStyle),
+					prompt: blockPrompt(messages, b, userGoal, config),
 				})
 			).trim();
-			const file = store.writeRaw(job.key, job.toolName, job.args, job.text);
-			// Summary not worth it: cache a marker so we don't retry every call.
-			const worth = summary.length > 0 && summary.length <= job.text.length * config.maxRatio;
-			const rec: SummaryRecord = { summary: worth ? summary : "", file, originalChars: job.text.length };
-			store.set(job.key, rec);
-			ready.set(job.idx, rec);
+			const file = store.writeBlock(key, blockLabel(b), transcript);
+			const worth = summary.length > 0 && summary.length <= transcript.length * config.maxRatio;
+			const rec: SummaryRecord = { summary: worth ? summary : "", file, originalChars: transcript.length };
+			store.set(key, rec);
 			result.newlySummarized++;
+			applyL2(b, rec);
 		} catch (e) {
-			result.errors.push(`${job.toolName}: ${e instanceof Error ? e.message : String(e)}`);
+			result.errors.push(`${blockLabel(b)}: ${e instanceof Error ? e.message : String(e)}`);
 		}
-	});
+	}
 
-	if (ready.size === 0) return result;
-
-	result.messages = messages.map((m, idx) => {
-		const rec = ready.get(idx);
-		if (!rec || !rec.summary) return m;
-		const original = textOf(m.content);
-		const text = placeholder(rec, m.toolName ?? "tool");
-		// Preserve non-text parts (e.g. images) as-is.
-		const nonText = Array.isArray(m.content) ? (m.content as AnyPart[]).filter((p) => p.type !== "text") : [];
-		result.squeezed++;
-		result.charsSaved += original.length - text.length;
-		return { ...m, content: [{ type: "text", text }, ...nonText] };
-	});
+	result.tokensAfter = total - systemTokens;
+	if (replaced.size === 0 && removed.size === 0) return result;
+	const out: MsgLike[] = [];
+	for (let i = 0; i < messages.length; i++) {
+		if (removed.has(i)) continue;
+		out.push(replaced.get(i) ?? messages[i]);
+	}
+	result.messages = out;
 	return result;
+}
+
+function latestUserText(messages: MsgLike[]): string {
+	for (let i = messages.length - 1; i >= 0; i--) {
+		if (messages[i].role === "user") {
+			const t = textOf(messages[i].content);
+			if (t) return t;
+		}
+	}
+	return "";
 }
 
 // ---- compressor prompts ----
@@ -410,19 +758,64 @@ export function compressorSystem(style: PromptStyle): string {
 	return style === "pi" ? PI_SYSTEM : SQUEEZE_SYSTEM;
 }
 
-export function compressorPrompt(req: SummarizeRequest, words: number, style: PromptStyle = "squeeze"): string {
-	if (style === "pi") {
+/** Appended to the compressor system prompt. Identical for every call in a pass, so it is a cacheable prefix. */
+export function sessionSection(transcript: string): string {
+	if (!transcript) return "";
+	return [
+		"",
+		"",
+		"Below is the agent's session so far (uncompressed, for background only). Use it to judge what matters:",
+		"what the user asked for, what the agent is trying to do, and which facts later steps relied on.",
+		"Only summarize the material the user message asks you to summarize; do not summarize this session.",
+		"<session>",
+		transcript,
+		"</session>",
+	].join("\n");
+}
+
+interface OutputJobLike {
+	toolName: string;
+	args: string;
+	text: string;
+}
+
+export function outputPrompt(job: OutputJobLike, userGoal: string, config: SqueezeConfig): string {
+	const output = clip(job.text, config.maxCompressorInputChars);
+	const args = clip(job.args, 4000);
+	if (config.promptStyle === "pi") {
 		const conversation = [
-			`[User]: ${req.userGoal || "(unknown)"}`,
-			`[Assistant tool calls]: ${req.toolName}(${piArgs(req.toolArgs)})`,
-			`[Tool result]: ${req.output}`,
+			`[User]: ${userGoal || "(unknown)"}`,
+			`[Assistant tool calls]: ${job.toolName}(${piArgs(args)})`,
+			`[Tool result]: ${output}`,
 		].join("\n\n");
 		return `<conversation>\n${conversation}\n</conversation>\n\n${PI_SUMMARIZATION_PROMPT}`;
 	}
 	return [
-		`Agent's latest user request (for relevance):\n<goal>\n${req.userGoal || "(unknown)"}\n</goal>`,
-		`Tool: ${req.toolName}\nArguments: ${req.toolArgs}`,
-		`<tool_output>\n${req.output}\n</tool_output>`,
-		`Summarize the tool output in at most ~${words} words (fewer if the output is simple).`,
+		`Agent's latest user request (for relevance):\n<goal>\n${userGoal || "(unknown)"}\n</goal>`,
+		`Tool: ${job.toolName}\nArguments: ${args}`,
+		`<tool_output>\n${output}\n</tool_output>`,
+		`Summarize this tool output in at most ~${config.summaryWords} words (fewer if the output is simple).`,
+	].join("\n\n");
+}
+
+export function blockPrompt(
+	messages: MsgLike[],
+	b: { from: number; to: number; steps: unknown[] },
+	userGoal: string,
+	config: SqueezeConfig,
+): string {
+	const transcript = clip(renderTranscript(messages, b.from, b.to), config.maxCompressorInputChars);
+	if (config.promptStyle === "pi") {
+		return `<conversation>\n[User]: ${userGoal || "(unknown)"}\n\n${transcript}\n</conversation>\n\n${PI_SUMMARIZATION_PROMPT}`;
+	}
+	return [
+		`Agent's latest user request (for relevance):\n<goal>\n${userGoal || "(unknown)"}\n</goal>`,
+		`The agent took the following ${b.steps.length} consecutive tool-calling steps. They will be removed from its context and replaced by your summary.`,
+		`<steps>\n${transcript}\n</steps>`,
+		[
+			`Summarize these steps in at most ~${config.blockSummaryWords} words as a record of what the agent did and learned:`,
+			"actions taken (commands, files read/edited), results and findings, exact errors, decisions and their reasons,",
+			"and anything still open. Preserve paths, line numbers, symbols, and values the agent may need later.",
+		].join(" "),
 	].join("\n\n");
 }

@@ -14,10 +14,7 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 // Host-provided at runtime (peer dependency); pi's own compaction routine, reused with another model.
 import { compact as piCompact } from "@earendil-works/pi-coding-agent";
 import {
-	estimateTokens,
 	formatTokens,
-	compressorPrompt,
-	compressorSystem,
 	PROMPT_STYLES,
 	type PromptStyle,
 	DEFAULT_CONFIG,
@@ -192,6 +189,7 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 
+		const systemTokens = Math.ceil(ctx.getSystemPrompt().length / 4);
 		const result = await squeezeMessages(
 			event.messages as unknown as MsgLike[],
 			config,
@@ -200,16 +198,17 @@ export default function (pi: ExtensionAPI) {
 				const res = await ctx.modelRegistry.complete(
 					compressor,
 					{
-						systemPrompt: compressorSystem(config.promptStyle),
+						// Shared per pass (whole-session transcript): cache it so parallel/following calls are cheap.
+						systemPrompt: req.system,
 						messages: [
 							{
 								role: "user",
-								content: [{ type: "text", text: compressorPrompt(req, config.summaryWords, config.promptStyle) }],
+								content: [{ type: "text", text: req.prompt }],
 								timestamp: Date.now(),
 							},
 						],
 					},
-					{ maxTokens: config.maxSummaryTokens, signal: ctx.signal, cacheRetention: "none" },
+					{ maxTokens: config.maxSummaryTokens, signal: ctx.signal, cacheRetention: "short" },
 				);
 				if (res.stopReason === "error" || res.stopReason === "aborted") {
 					throw new Error(res.errorMessage || res.stopReason);
@@ -220,22 +219,24 @@ export default function (pi: ExtensionAPI) {
 					.join("\n");
 			},
 			ctx.signal,
+			systemTokens,
 		);
 
 		totals.calls++;
 		totals.charsSaved = result.charsSaved; // savings on the latest call
 		saved.squeeze += Math.round(result.charsSaved / 4);
 		if (result.charsSaved > 0) persistSaved();
-		lastPromptTokens = estimateTokens(result.messages) + Math.ceil(ctx.getSystemPrompt().length / 4);
+		lastPromptTokens = result.tokensAfter + systemTokens;
 		totals.summarized += result.newlySummarized;
 		totals.errors += result.errors.length;
-		lastReport = `last call: ${result.squeezed} outputs squeezed, ~${Math.round(result.charsSaved / 4)} tokens saved, ${result.newlySummarized} new summaries`;
+		const target = config.contextTarget > 0 ? ` (target ${formatTokens(config.contextTarget)})` : "";
+		lastReport = `last call: ${result.squeezed} outputs squeezed, ${result.blocks} blocks collapsed, ~${formatTokens(lastPromptTokens)} tokens sent${target}, ~${Math.round(result.charsSaved / 4)} saved, ${result.newlySummarized} new summaries`;
 		if (result.errors.length) {
 			lastReport += `, ${result.errors.length} errors (${result.errors[0]})`;
 			if (ctx.hasUI) ctx.ui.notify(`pi-squeeze: ${result.errors.length} summary call(s) failed: ${result.errors[0]}`, "warning");
 		}
 		updateStatus(ctx);
-		if (result.squeezed === 0) return;
+		if (result.squeezed === 0 && result.blocks === 0) return;
 		return { messages: result.messages as unknown as typeof event.messages };
 	});
 
@@ -290,6 +291,7 @@ export default function (pi: ExtensionAPI) {
 			`targets: ${config.targetModels.join(", ") || "(all models)"}`,
 			`active model: ${modelKey(ctx.model) ?? "?"} -> ${shouldSqueezeFor(config, modelKey(ctx.model)) ? "squeezing" : "not squeezing"}`,
 			`keepFirst=${config.keepFirstToolTurns} keepRecent=${config.keepRecentToolTurns} minChars=${config.minChars} summaryWords=${config.summaryWords}`,
+			`contextTarget=${config.contextTarget > 0 ? formatTokens(config.contextTarget) : "0 (compress all eligible)"} low=${config.targetLowRatio} maxBlockSteps=${config.maxBlockSteps} blockSummaryWords=${config.blockSummaryWords} compressorContextChars=${config.compressorContextChars}`,
 			lastReport || "no calls yet",
 			`compaction: ${config.compactWithCompressor ? "via compressor" : "via chat model"}, auto at ${config.compactAtPercent > 0 ? `${config.compactAtPercent}%` : "off"}${lastPromptTokens !== null && ctx.model?.contextWindow ? ` (now ~${formatTokens(lastPromptTokens)} / ${formatTokens(ctx.model.contextWindow)})` : ""}`,
 			`saved this session: ~${formatTokens(saved.squeeze + saved.compaction)} tokens (squeeze ${formatTokens(saved.squeeze)}, compaction ${formatTokens(saved.compaction)})`,
@@ -351,8 +353,11 @@ export default function (pi: ExtensionAPI) {
 					const raw = rest.join(" ");
 					const def = (DEFAULT_CONFIG as unknown as Record<string, unknown>)[key];
 					let value: unknown = raw;
-					if (typeof def === "number") value = Number(raw);
-					else if (typeof def === "boolean") value = raw === "true" || raw === "on";
+					if (typeof def === "number") {
+						// Allow 40k / 1.5M shorthands.
+						const mm = /^([\d.]+)\s*([kKmM])?$/.exec(raw.replace(/_/g, ""));
+						value = mm ? Number(mm[1]) * (mm[2] ? (mm[2].toLowerCase() === "k" ? 1e3 : 1e6) : 1) : Number.NaN;
+					} else if (typeof def === "boolean") value = raw === "true" || raw === "on";
 					else if (Array.isArray(def)) value = raw ? raw.split(",").map((s) => s.trim()) : [];
 					if (typeof value === "number" && Number.isNaN(value)) {
 						ctx.ui.notify(`${key} needs a number`, "error");

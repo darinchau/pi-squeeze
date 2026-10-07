@@ -3,7 +3,7 @@ import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { compressorPrompt, compressorSystem, DEFAULT_CONFIG, estimateTokens, formatTokens, type MsgLike, SqueezeStore, shouldSqueezeFor, squeezeMessages } from "../src/core.ts";
+import { outputPrompt, compressorSystem, DEFAULT_CONFIG, estimateTokens, formatTokens, type MsgLike, SqueezeStore, shouldSqueezeFor, squeezeMessages } from "../src/core.ts";
 
 const big = (tag: string) => `${tag} `.repeat(1000); // ~4000+ chars
 
@@ -16,7 +16,8 @@ function convo(nTurns: number): MsgLike[] {
 	return msgs;
 }
 
-const cfg = { ...DEFAULT_CONFIG, compressorModel: "cheap/m", keepRecentToolTurns: 2, keepFirstToolTurns: 0 };
+// maxBlockSteps: 1 = per-output summaries only (legacy behaviour); block tests override it.
+const cfg = { ...DEFAULT_CONFIG, compressorModel: "cheap/m", keepRecentToolTurns: 2, keepFirstToolTurns: 0, maxBlockSteps: 1 };
 
 test("squeezes old outputs, keeps recent ones, writes raw files, caches", async () => {
 	const store = new SqueezeStore(mkdtempSync(join(tmpdir(), "sq-")));
@@ -80,13 +81,13 @@ test("never touches user/assistant/system messages; protects first tool turn", a
 });
 
 test("prompt styles", () => {
-	const req = { toolName: "bash", toolArgs: JSON.stringify({ command: "ls" }), output: "OUT", userGoal: "GOAL" };
-	const pi = compressorPrompt(req, 100, "pi");
+	const job = { toolName: "bash", args: JSON.stringify({ command: "ls" }), text: "OUT" };
+	const pi = outputPrompt(job, "GOAL", { ...cfg, promptStyle: "pi" });
 	assert.match(pi, /<conversation>\n\[User\]: GOAL/);
 	assert.match(pi, /\[Assistant tool calls\]: bash\(command="ls"\)/);
 	assert.match(pi, /## Goal/);
 	assert.match(compressorSystem("pi"), /context summarization assistant/);
-	assert.match(compressorPrompt(req, 100, "squeeze"), /<tool_output>\nOUT/);
+	assert.match(outputPrompt(job, "GOAL", cfg), /<tool_output>\nOUT/);
 	assert.match(compressorSystem("squeeze"), /compress tool outputs/);
 });
 
@@ -110,4 +111,106 @@ test("estimateTokens / formatTokens", () => {
 	assert.equal(formatTokens(1234), "1.2k");
 	assert.equal(formatTokens(123_456), "123k");
 	assert.equal(formatTokens(2_500_000), "2.50M");
+});
+
+// ---- block summarization / contextTarget ----
+
+const bcfg = { ...DEFAULT_CONFIG, compressorModel: "cheap/m", keepRecentToolTurns: 2, keepFirstToolTurns: 0, maxBlockSteps: 10 };
+
+function mkStore() {
+	return new SqueezeStore(mkdtempSync(join(tmpdir(), "sq-blk-")));
+}
+
+test("collapses consecutive old steps into one block; keeps user + recent steps verbatim", async () => {
+	const msgs = convo(6); // user, then 6 x (assistant call, result)
+	const reqs: { kind: string; system: string; prompt: string }[] = [];
+	const r = await squeezeMessages(msgs, bcfg, mkStore(), async (req) => {
+		reqs.push(req);
+		return req.kind === "block" ? "BLOCK SUMMARY" : "out summary";
+	});
+	assert.equal(r.blocks, 1);
+	assert.equal(r.messagesRemoved, 7); // steps 1-4 = 8 messages -> 1
+	assert.equal(r.messages.length, msgs.length - 7);
+	assert.deepEqual(r.messages[0], msgs[0]); // user message verbatim
+	const blk = r.messages[1];
+	assert.equal(blk.role, "assistant");
+	assert.equal(blk.stopReason, "stop");
+	const text = (blk.content as { text: string }[])[0].text;
+	assert.match(text, /steps S1-S4/);
+	assert.match(text, /BLOCK SUMMARY/);
+	const file = /Full original transcript: (.+)/.exec(text)![1];
+	const raw = readFileSync(file, "utf8");
+	assert.match(raw, /out0 out0/);
+	assert.match(raw, /out3 out3/);
+	// recent 2 steps untouched, tool calls intact
+	assert.deepEqual(r.messages.slice(2), msgs.slice(9));
+	// no orphaned tool results
+	for (const m of r.messages) if (m.role === "toolResult") assert.ok(["c4", "c5"].includes(String(m.toolCallId)));
+	// compressor sees whole uncompressed session, identical system prompt across calls (cacheable prefix)
+	const blockReq = reqs.find((q) => q.kind === "block")!;
+	assert.match(blockReq.system, /<session>/);
+	assert.match(blockReq.system, /out5 out5/);
+	assert.match(blockReq.system, /find the bug/);
+	assert.equal(new Set(reqs.map((q) => q.system)).size, 1);
+});
+
+test("user messages are barriers: blocks never span them", async () => {
+	const msgs = convo(6);
+	msgs.splice(5, 0, { role: "user", content: [{ type: "text", text: "also check X" }] }); // between step 2 and 3
+	const r = await squeezeMessages(msgs, bcfg, mkStore(), async (req) => (req.kind === "block" ? "BS" : "os"));
+	assert.equal(r.blocks, 2);
+	assert.ok(r.messages.some((m) => m.role === "user" && JSON.stringify(m.content).includes("also check X")));
+	const labels = r.messages.map((m) => JSON.stringify(m.content).match(/steps S\d-S\d/)?.[0]).filter(Boolean);
+	assert.deepEqual(labels, ["steps S1-S2", "steps S3-S4"]);
+});
+
+test("contextTarget: stops compressing once under target, oldest first", async () => {
+	const msgs = convo(8);
+	const full = estimateTokens(msgs);
+	let calls = 0;
+	const summarize = async () => {
+		calls++;
+		return "s";
+	};
+	// Target already met: nothing happens, no compressor calls.
+	const none = await squeezeMessages(msgs, { ...bcfg, contextTarget: full + 1000 }, mkStore(), summarize);
+	assert.equal(calls, 0);
+	assert.equal(none.messages, msgs);
+	// Target slightly below full: only the oldest output(s) get squeezed, no blocks needed.
+	const r = await squeezeMessages(msgs, { ...bcfg, contextTarget: full - 500 }, mkStore(), summarize);
+	assert.ok(r.squeezed >= 1 && r.squeezed < 6);
+	assert.equal(r.blocks, 0);
+	assert.ok(r.tokensAfter <= full - 500);
+	// Hysteresis: once triggered it compresses down to targetLowRatio * target, not just under it.
+	assert.ok(r.tokensAfter <= (full - 500) * DEFAULT_CONFIG.targetLowRatio);
+	const tight = await squeezeMessages(msgs, { ...bcfg, contextTarget: full - 500, targetLowRatio: 1, concurrency: 1 }, mkStore(), summarize);
+	assert.equal(tight.squeezed, 1);
+	assert.match(JSON.stringify(r.messages[2].content), /pi-squeeze/); // oldest result first
+	assert.doesNotMatch(JSON.stringify(r.messages[12].content), /pi-squeeze/);
+});
+
+test("block summaries are cached and reused; growth keeps old block stable", async () => {
+	const store = mkStore();
+	let blockCalls = 0;
+	const summarize = async (req: { kind: string }) => {
+		if (req.kind === "block") blockCalls++;
+		return req.kind === "block" ? "BS" : "os";
+	};
+	const msgs = convo(6);
+	const r1 = await squeezeMessages(msgs, bcfg, store, summarize);
+	const r2 = await squeezeMessages(msgs, bcfg, store, summarize);
+	assert.equal(blockCalls, 1);
+	assert.deepEqual(r2.messages, r1.messages);
+	// L1 summaries of outputs inside the block were made first; cached too.
+	assert.equal(r2.newlySummarized, 0);
+});
+
+test("single-step runs only get per-output summaries; compressor errors don't break", async () => {
+	const msgs = convo(3); // 1 eligible step
+	const r = await squeezeMessages(msgs, bcfg, mkStore(), async () => {
+		throw new Error("boom");
+	});
+	assert.equal(r.blocks, 0);
+	assert.equal(r.messages, msgs);
+	assert.match(r.errors[0], /boom/);
 });
