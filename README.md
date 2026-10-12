@@ -11,7 +11,7 @@ A pi extension that cuts the input tokens sent to an expensive model. Before eve
 - If a summary isn't meaningfully shorter than the original (`maxRatio`), the original is kept.
 - Failed compressor calls (summaries and compaction) are retried up to 3 times with backoff. If all attempts fail, the turn isn't blocked; the affected output is just sent unsqueezed.
 - Compaction runs on the compressor too. Every pi compaction (auto, `/compact`, `/squeeze-compact`) uses pi's own `compact()` routine with the compressor model instead of the chat model. That covers the same prompts, split-turn and file-list handling. If the compressor fails, pi's default compaction runs.
-- Once the squeezed prompt reaches `compactAtPercent` of the chat model's context window, a compaction is triggered when the agent goes idle. It never fires mid-run, because `ctx.compact()` aborts the turn.
+- Once the squeezed prompt reaches `compactAtPercent` of the chat model's context window, the compaction is **deferred to the next prompt**: pi-squeeze arms it when the agent goes idle (footer shows `compact-next`) and runs it right after you submit your next message, before that message is passed to the agent. Nothing is interrupted, nothing is compacted while the context is still in use, and a session you walk away from never spends a compaction call. (Mid-run, pi's own threshold/overflow compaction still applies, on the compressor via the hook.)
 
 ## Install
 
@@ -49,7 +49,7 @@ The commands work in the TUI and in pi web, which forwards the select/input dial
 | `/squeeze status` | Print status |
 | `/squeeze-compact [instructions]` | Compact now with the compressor model |
 
-The footer shows `squeeze:<model> ▼<N> tok saved <P>%`. N is the main-model input tokens avoided this session, counting squeezing on every call plus the history each compaction would have fed the chat model. P is the squeezed prompt size as a percentage of the context window.
+The footer shows `squeeze:<model> ▼<P>% (<context window>)` while squeezing is active for the current model, e.g. `squeeze:qwen3.8-27b ▼42% (1.00M)`. P is the squeezed prompt size as a percentage of the chat model's context window. When a compaction is armed for your next prompt, ` compact-next` is appended. When squeezing is inactive for the current model (extension off, no compressor set, active model is the compressor, or not matching `targetModels`), the footer shows nothing at all.
 
 ## Config
 
@@ -59,7 +59,7 @@ Config lives in `~/.pi/agent/pi-squeeze.json`. You can override the path with `P
 | --- | --- | --- |
 | `enabled` | `true` | Master switch |
 | `compressorModel` | `""` | `provider/modelId`. Nothing happens while this is empty. |
-| `targetModels` | `[]` | Active-model patterns to squeeze for. Empty means all models except the compressor. |
+| `targetModels` | `[]` | Active-model patterns to squeeze for. Empty means all models except the compressor. This only gates tool-output squeezing; compactions still run on the compressor for every model (see `compactWithCompressor`). |
 | `keepRecentToolTurns` | `2` | Recent tool-calling turns left verbatim |
 | `keepFirstToolTurns` | `1` | First tool-calling turns left verbatim (initial exploration) |
 | `minChars` | `1500` | Smaller outputs are left alone |
@@ -69,7 +69,7 @@ Config lives in `~/.pi/agent/pi-squeeze.json`. You can override the path with `P
 | `concurrency` | `4` | Parallel compressor calls |
 | `maxSummaryTokens` | `2048` | Output cap per summary |
 | `promptStyle` | `squeeze` | `squeeze` or `pi` |
-| `compactAtPercent` | `70` | Auto-compact when the squeezed prompt reaches this % of the context window. `0` turns it off. |
+| `compactAtPercent` | `70` | Arm a compaction when the squeezed prompt reaches this % of the context window; it runs right before your next prompt is processed. `0` turns it off. |
 | `compactWithCompressor` | `true` | Run compactions on the compressor model |
 
 ## Trade-offs
@@ -79,6 +79,7 @@ Config lives in `~/.pi/agent/pi-squeeze.json`. You can override the path with `P
 - Summaries can drop details. The agent is told where the raw file is, but it has to decide to look.
 - It can hurt models that do have prompt caching, because rewriting old messages changes the prefix. Use `targetModels` to restrict it to the uncached model.
 - Raw files live in the OS temp dir. If they are deleted, the affected outputs are re-summarized on the next call.
+- The deferred compaction needs a next prompt in the same process. In one-shot modes (`pi -p`, JSON) it may never run; pi's own threshold compaction still protects those sessions (on the compressor via the hook).
 
 ## Development
 

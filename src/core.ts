@@ -111,6 +111,30 @@ export function shouldSqueezeFor(config: SqueezeConfig, activeModel: string | un
 	return config.targetModels.some((p) => globMatch(p, activeModel));
 }
 
+/**
+ * Footer status text. Empty string when squeezing is inactive for the active model
+ * (extension off, compressor unset, active model is the compressor, or not a target):
+ * the caller then clears its status entirely instead of rendering text.
+ * Active: `squeeze:<model> ▼<pct>% (<context window>)`, plus ` compact-next` when a
+ * deferred compaction is waiting for the next prompt.
+ */
+export function statusBarText(
+	config: SqueezeConfig,
+	activeModel: string | undefined,
+	promptTokens: number | null,
+	contextWindow: number | undefined,
+	compactPending = false,
+): string {
+	if (!shouldSqueezeFor(config, activeModel)) return "";
+	const parts = [`squeeze:${config.compressorModel.split("/").pop()}`];
+	if (promptTokens !== null && contextWindow) {
+		parts.push(`▼${Math.round((promptTokens / contextWindow) * 100)}%`);
+	}
+	if (contextWindow) parts.push(`(${formatTokens(contextWindow)})`);
+	if (compactPending) parts.push("compact-next");
+	return parts.join(" ");
+}
+
 // ---- minimal structural message types (subset of pi-ai Message) ----
 type TextPart = { type: "text"; text: string };
 type AnyPart = { type: string; [k: string]: unknown };
