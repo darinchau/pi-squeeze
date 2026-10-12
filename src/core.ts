@@ -115,21 +115,20 @@ export function shouldSqueezeFor(config: SqueezeConfig, activeModel: string | un
  * Footer status text. Empty string when squeezing is inactive for the active model
  * (extension off, compressor unset, active model is the compressor, or not a target):
  * the caller then clears its status entirely instead of rendering text.
- * Active: `squeeze:<model> ▼<pct>% (<context window>)`, plus ` compact-next` when a
- * deferred compaction is waiting for the next prompt.
+ * Active: `squeeze:<model> ▼<N> (<context window>)`, where N is the cumulative main-model
+ * input tokens saved this session (summed per call), plus ` compact-next` when a deferred
+ * compaction is waiting for the next prompt.
  */
 export function statusBarText(
 	config: SqueezeConfig,
 	activeModel: string | undefined,
-	promptTokens: number | null,
+	savedTokens: number,
 	contextWindow: number | undefined,
 	compactPending = false,
 ): string {
 	if (!shouldSqueezeFor(config, activeModel)) return "";
 	const parts = [`squeeze:${config.compressorModel.split("/").pop()}`];
-	if (promptTokens !== null && contextWindow) {
-		parts.push(`▼${Math.round((promptTokens / contextWindow) * 100)}%`);
-	}
+	if (savedTokens > 0) parts.push(`▼${formatTokens(savedTokens)}`);
 	if (contextWindow) parts.push(`(${formatTokens(contextWindow)})`);
 	if (compactPending) parts.push("compact-next");
 	return parts.join(" ");

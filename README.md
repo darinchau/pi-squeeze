@@ -49,7 +49,7 @@ The commands work in the TUI and in pi web, which forwards the select/input dial
 | `/squeeze status` | Print status |
 | `/squeeze-compact [instructions]` | Compact now with the compressor model |
 
-The footer shows `squeeze:<model> ▼<P>% (<context window>)` while squeezing is active for the current model, e.g. `squeeze:qwen3.8-27b ▼42% (1.00M)`. P is the squeezed prompt size as a percentage of the chat model's context window. When a compaction is armed for your next prompt, ` compact-next` is appended. When squeezing is inactive for the current model (extension off, no compressor set, active model is the compressor, or not matching `targetModels`), the footer shows nothing at all.
+The footer shows `squeeze:<model> ▼<N> (<context window>)` while squeezing is active for the current model, e.g. `squeeze:qwen3.8-27b ▼27k (1.00M)`. N is the main-model input tokens avoided this session, summed per call: if call 1 sends 13k fewer tokens and call 2 sends 14k fewer, N is 27k, even though most of call 2's savings come from the same old outputs. Each compressor compaction also adds the history the chat model would otherwise have summarized. N is hidden until something has been saved. When a compaction is armed for your next prompt, ` compact-next` is appended. When squeezing is inactive for the current model (extension off, no compressor set, active model is the compressor, or not matching `targetModels`), the footer shows nothing at all.
 
 ## Config
 
