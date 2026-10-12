@@ -3,7 +3,7 @@ import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { compressorPrompt, compressorSystem, DEFAULT_CONFIG, estimateTokens, formatTokens, type MsgLike, SqueezeStore, shouldSqueezeFor, squeezeMessages, statusBarText, withRetry } from "../src/core.ts";
+import { compactThresholdCrossed, compressorPrompt, compressorSystem, DEFAULT_CONFIG, estimateTokens, formatTokens, type MsgLike, SqueezeStore, shouldSqueezeFor, squeezeMessages, statusBarText, withRetry } from "../src/core.ts";
 
 const big = (tag: string) => `${tag} `.repeat(1000); // ~4000+ chars
 
@@ -121,12 +121,18 @@ test("shouldSqueezeFor", () => {
 });
 
 test("statusBarText: empty when inactive, otherwise squeeze:<model> ▼<saved> (<window>)", () => {
-	// Inactive (off, no compressor, active model is the compressor, or not a target): no text at all.
+	// Inactive (off, no compressor, active model is the compressor, or not a target) with
+	// nothing armed: no text at all.
 	assert.equal(statusBarText({ ...cfg, enabled: false }, "big/opus", 27_000, 200_000), "");
 	assert.equal(statusBarText({ ...cfg, compressorModel: "" }, "big/opus", 27_000, 200_000), "");
 	assert.equal(statusBarText(cfg, "cheap/m", 27_000, 200_000), "");
 	assert.equal(statusBarText({ ...cfg, targetModels: ["big/*"] }, "other/x", 27_000, 200_000), "");
 	assert.equal(statusBarText(cfg, undefined, 27_000, 200_000), "");
+	// Compaction is global: even while squeezing is inactive, an armed deferred
+	// compaction still shows the marker (no squeeze:<model> prefix — nothing is squeezed).
+	assert.equal(statusBarText({ ...cfg, enabled: false }, "big/opus", 27_000, 200_000, true), "compact-next");
+	assert.equal(statusBarText({ ...cfg, compressorModel: "" }, "big/opus", 27_000, 200_000, true), "compact-next");
+	assert.equal(statusBarText({ ...cfg, targetModels: ["big/*"] }, "other/x", 0, undefined, true), "compact-next");
 	// Active: model, cumulative tokens saved (absolute), window size.
 	assert.equal(statusBarText(cfg, "big/opus", 13_000 + 14_000, 200_000), "squeeze:m ▼27k (200k)");
 	// Multi-segment model ids: the label is the id's last segment.
@@ -137,6 +143,22 @@ test("statusBarText: empty when inactive, otherwise squeeze:<model> ▼<saved> (
 	assert.equal(statusBarText(cfg, "big/opus", 0, undefined), "squeeze:m");
 	// Deferred compaction marker.
 	assert.equal(statusBarText(cfg, "big/opus", 27_000, 200_000, true), "squeeze:m ▼27k (200k) compact-next");
+});
+
+test("compactThresholdCrossed: global, only compactAtPercent gates it", () => {
+	const window = 100_000;
+	// The squeeze master switch never gates the threshold compaction.
+	assert.equal(compactThresholdCrossed({ ...cfg, enabled: false, compactAtPercent: 70 }, 75_000, window), true);
+	assert.equal(compactThresholdCrossed({ ...cfg, enabled: false, compactAtPercent: 70 }, 69_999, window), false);
+	// compactAtPercent = 0 disables it.
+	assert.equal(compactThresholdCrossed({ ...cfg, compactAtPercent: 0 }, 999_999, window), false);
+	// No context window known: never arm.
+	assert.equal(compactThresholdCrossed(cfg, 75_000, undefined), false);
+	// Boundary: >= is crossed.
+	assert.equal(compactThresholdCrossed(cfg, 70_000, window), true);
+	assert.equal(compactThresholdCrossed(cfg, 69_999, window), false);
+	// Squeezing-inactive model (not a target) still crosses — compaction is global.
+	assert.equal(compactThresholdCrossed({ ...cfg, targetModels: ["big/*"], compactAtPercent: 70 }, 90_000, window), true);
 });
 
 test("never touches user/assistant/system messages; protects first tool turn", async () => {

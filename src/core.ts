@@ -8,7 +8,9 @@ import { join } from "node:path";
 export interface SqueezeConfig {
 	/** Master switch. */
 	enabled: boolean;
-	/** Compression model as "provider/modelId". Empty = not configured (extension stays idle). */
+	/** Compression model as "provider/modelId". Empty = not configured: tool-output
+	 *  squeezing and compressor-driven compaction stay idle, but threshold compaction
+	 *  (compactAtPercent) still runs on the chat model via pi's default compaction. */
 	compressorModel: string;
 	/**
 	 * Only squeeze when the active (expensive) model matches one of these "provider/modelId"
@@ -33,7 +35,8 @@ export interface SqueezeConfig {
 	maxSummaryTokens: number;
 	/** Compressor prompt: "squeeze" (terse, per tool output) or "pi" (pi's built-in compaction prompt). */
 	promptStyle: PromptStyle;
-	/** Compact when the (squeezed) prompt reaches this % of the main model's context window. 0 = off. */
+	/** Compact when the (possibly squeezed) prompt reaches this % of the main model's context
+	 *  window, even when squeezing is disabled for the model — compaction is global. 0 = off. */
 	compactAtPercent: number;
 	/** Run pi compactions (auto, /compact, /squeeze-compact) with the compressor model instead of the chat model. */
 	compactWithCompressor: boolean;
@@ -111,13 +114,28 @@ export function shouldSqueezeFor(config: SqueezeConfig, activeModel: string | un
 	return config.targetModels.some((p) => globMatch(p, activeModel));
 }
 
+/** True when the measured prompt has reached `compactAtPercent` of the context window —
+ *  i.e. the deferred auto-compaction should be armed. Deliberately independent of
+ *  `config.enabled`: threshold compaction is global and only `compactAtPercent` gates it. */
+export function compactThresholdCrossed(
+	config: SqueezeConfig,
+	promptTokens: number,
+	contextWindow: number | undefined,
+): boolean {
+	if (config.compactAtPercent <= 0 || !contextWindow) return false;
+	return (promptTokens / contextWindow) * 100 >= config.compactAtPercent;
+}
+
 /**
  * Footer status text. Empty string when squeezing is inactive for the active model
- * (extension off, compressor unset, active model is the compressor, or not a target):
- * the caller then clears its status entirely instead of rendering text.
+ * (extension off, compressor unset, active model is the compressor, or not a target)
+ * and no deferred compaction is armed: the caller then clears its status entirely
+ * instead of rendering text.
  * Active: `squeeze:<model> ▼<N> (<context window>)`, where N is the cumulative main-model
  * input tokens saved this session (summed per call), plus ` compact-next` when a deferred
  * compaction is waiting for the next prompt.
+ * Squeezing inactive but a deferred compaction is armed: `compact-next` only — compaction
+ * is global, so the marker shows even when nothing is being squeezed.
  */
 export function statusBarText(
 	config: SqueezeConfig,
@@ -126,7 +144,7 @@ export function statusBarText(
 	contextWindow: number | undefined,
 	compactPending = false,
 ): string {
-	if (!shouldSqueezeFor(config, activeModel)) return "";
+	if (!shouldSqueezeFor(config, activeModel)) return compactPending ? "compact-next" : "";
 	const parts = [`squeeze:${config.compressorModel.split("/").pop()}`];
 	if (savedTokens > 0) parts.push(`▼${formatTokens(savedTokens)}`);
 	if (contextWindow) parts.push(`(${formatTokens(contextWindow)})`);
