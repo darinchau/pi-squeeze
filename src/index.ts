@@ -3,7 +3,8 @@
  * cheap "compressor" model. Originals are kept in tmp files so the agent can rg/read them.
  *
  * Also: pi compactions (auto, /compact, /squeeze-compact) are summarized by the compressor model,
- * and a compaction is triggered when the squeezed prompt reaches compactAtPercent of the context window.
+ * and once the squeezed prompt reaches compactAtPercent of the context window a compaction is
+ * deferred to the next prompt (never fired at idle, so nothing gets interrupted).
  *
  * Commands: /squeeze [status|on|off|model|targets|style|set <key> <value>], /squeeze-compact [instructions]
  */
@@ -28,6 +29,7 @@ import {
 	saveConfig,
 	shouldSqueezeFor,
 	squeezeMessages,
+	statusBarText,
 	withRetry,
 	CHEAP_MODEL_RETRIES,
 } from "./core.ts";
@@ -47,6 +49,8 @@ export default function (pi: ExtensionAPI) {
 	// Estimated main-model prompt size after the latest squeeze; null until measured after a compaction.
 	let lastPromptTokens: number | null = null;
 	let compacting = false;
+	// Threshold crossed at idle: compact just before the next prompt is processed, not now.
+	let compactPending = false;
 
 	const persist = () => saveConfig(configPath(), config);
 	const modelKey = (m: { provider: string; id: string } | undefined) => (m ? `${m.provider}/${m.id}` : undefined);
@@ -79,14 +83,9 @@ export default function (pi: ExtensionAPI) {
 
 	function updateStatus(ctx: ExtensionContext) {
 		if (!ctx.hasUI) return;
-		if (!config.enabled) return ctx.ui.setStatus("pi-squeeze", undefined);
-		const label = config.compressorModel ? `squeeze:${config.compressorModel.split("/").pop()}` : "squeeze:no-model";
-		const total = saved.squeeze + saved.compaction;
-		const savedText = total > 0 ? ` ▼${formatTokens(total)} tok saved` : "";
-		const ctxText = lastPromptTokens !== null && ctx.model?.contextWindow
-			? ` ${Math.round((lastPromptTokens / ctx.model.contextWindow) * 100)}%`
-			: "";
-		ctx.ui.setStatus("pi-squeeze", label + savedText + ctxText);
+		const text = statusBarText(config, modelKey(ctx.model), lastPromptTokens, ctx.model?.contextWindow, compactPending);
+		// Empty text = squeezing inactive for the active model: clear the footer entry entirely.
+		ctx.ui.setStatus("pi-squeeze", text || undefined);
 	}
 
 	function compressorUsable(ctx: ExtensionContext) {
@@ -96,20 +95,47 @@ export default function (pi: ExtensionAPI) {
 		return m;
 	}
 
-	function triggerCompact(ctx: ExtensionContext, why: string, customInstructions?: string) {
-		if (compacting) return;
-		compacting = true;
-		if (ctx.hasUI) ctx.ui.notify(`pi-squeeze: compacting (${why})`, "info");
-		ctx.compact({
-			customInstructions,
-			onComplete: () => {
+	/**
+	 * Run a compaction via pi (summarized by the compressor when possible; see the
+	 * session_before_compact hook). Always resolves, never rejects, so callers can
+	 * await it without hanging the surrounding pipeline.
+	 */
+	function runCompact(ctx: ExtensionContext, why: string, customInstructions?: string): Promise<void> {
+		return new Promise<void>((resolve) => {
+			if (compacting) return resolve();
+			compacting = true;
+			if (ctx.hasUI) ctx.ui.notify(`pi-squeeze: compacting (${why})`, "info");
+			let settled = false;
+			const done = () => {
+				if (settled) return;
+				settled = true;
 				compacting = false;
-				updateStatus(ctx);
-			},
-			onError: (err) => {
-				compacting = false;
-				if (ctx.hasUI) ctx.ui.notify(`pi-squeeze: compaction failed: ${err.message}`, "error");
-			},
+				resolve();
+			};
+			try {
+				ctx.compact({
+					customInstructions,
+					// The session may have been reloaded mid-compaction; never leave callers hanging.
+					onComplete: () => {
+						try {
+							updateStatus(ctx);
+						} catch {
+							/* runtime gone */
+						}
+						done();
+					},
+					onError: (err) => {
+						try {
+							if (ctx.hasUI) ctx.ui.notify(`pi-squeeze: compaction failed: ${err.message}`, "error");
+						} catch {
+							/* runtime gone */
+						}
+						done();
+					},
+				});
+			} catch {
+				done();
+			}
 		});
 	}
 
@@ -121,6 +147,7 @@ export default function (pi: ExtensionAPI) {
 	pi.on("session_start", async (_e, ctx) => {
 		config = loadConfig(configPath());
 		lastPromptTokens = null;
+		compactPending = false;
 		getStore(ctx);
 		updateStatus(ctx);
 	});
@@ -175,19 +202,53 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("session_compact", async (_e, ctx) => {
 		lastPromptTokens = null; // re-measure on the next call
+		compactPending = false; // the context is fresh now
 		updateStatus(ctx);
 	});
 
-	// Threshold check at idle: ctx.compact() aborts a running turn, so never fire mid-run.
-	// (Mid-run, pi's own threshold/overflow compaction still runs, on the compressor via the hook above.)
+	// Threshold crossed at idle: don't compact now. ctx.compact() would abort whatever
+	// runs next and pi rejects prompt submission while a compaction is in flight, which is
+	// what killed the session before. Instead arm a deferred compaction and run it from the
+	// input handler below, just before the next prompt is processed.
 	pi.on("agent_settled", async (_e, ctx) => {
 		if (!config.enabled || config.compactAtPercent <= 0 || lastPromptTokens === null) return;
 		const window = ctx.model?.contextWindow;
 		if (!window) return;
 		const pct = (lastPromptTokens / window) * 100;
-		if (pct < config.compactAtPercent) return;
-		lastPromptTokens = null; // loop guard: needs a fresh measurement before triggering again
-		triggerCompact(ctx, `prompt ~${Math.round(pct)}% of ${formatTokens(window)} >= ${config.compactAtPercent}%`);
+		if (pct < config.compactAtPercent || compactPending) return;
+		compactPending = true;
+		if (ctx.hasUI) {
+			ctx.ui.notify(
+				`pi-squeeze: prompt ~${Math.round(pct)}% of ${formatTokens(window)} — will compact on your next prompt`,
+				"info",
+			);
+		}
+		updateStatus(ctx);
+	});
+
+	// "Compact at next prompt": the input event fires before pi queues the message, so awaiting
+	// the compaction here means the next turn starts on the compacted context. Only fresh,
+	// idle prompts qualify (streamingBehavior is set while steering a live run, and compacting
+	// would abort it). Steering inputs pass through; the pending compaction stays armed.
+	pi.on("input", async (event, ctx) => {
+		if (!compactPending || event.streamingBehavior) return;
+		compactPending = false;
+		const window = ctx.model?.contextWindow;
+		if (!config.enabled || config.compactAtPercent <= 0 || lastPromptTokens === null || !window) {
+			updateStatus(ctx);
+			return;
+		}
+		const pct = (lastPromptTokens / window) * 100;
+		updateStatus(ctx);
+		if (pct < config.compactAtPercent) return; // e.g. switched to a model with a bigger window
+		await runCompact(ctx, `prompt ~${Math.round(pct)}% of ${formatTokens(window)} >= ${config.compactAtPercent}%`);
+		updateStatus(ctx);
+		// Fall through: the submitted prompt is processed on the compacted context.
+	});
+
+	// Squeezing activity depends on the active model; refresh the footer when it changes.
+	pi.on("model_select", async (_e, ctx) => {
+		updateStatus(ctx);
 	});
 
 	pi.on("context", async (event, ctx) => {
@@ -297,7 +358,7 @@ export default function (pi: ExtensionAPI) {
 			`active model: ${modelKey(ctx.model) ?? "?"} -> ${shouldSqueezeFor(config, modelKey(ctx.model)) ? "squeezing" : "not squeezing"}`,
 			`keepFirst=${config.keepFirstToolTurns} keepRecent=${config.keepRecentToolTurns} minChars=${config.minChars} summaryWords=${config.summaryWords}`,
 			lastReport || "no calls yet",
-			`compaction: ${config.compactWithCompressor ? "via compressor" : "via chat model"}, auto at ${config.compactAtPercent > 0 ? `${config.compactAtPercent}%` : "off"}${lastPromptTokens !== null && ctx.model?.contextWindow ? ` (now ~${formatTokens(lastPromptTokens)} / ${formatTokens(ctx.model.contextWindow)})` : ""}`,
+			`compaction: ${config.compactWithCompressor ? "via compressor" : "via chat model"}, auto at ${config.compactAtPercent > 0 ? `${config.compactAtPercent}% on next prompt${compactPending ? " (pending)" : ""}` : "off"}${lastPromptTokens !== null && ctx.model?.contextWindow ? ` (now ~${formatTokens(lastPromptTokens)} / ${formatTokens(ctx.model.contextWindow)})` : ""}`,
 			`saved this session: ~${formatTokens(saved.squeeze + saved.compaction)} tokens (squeeze ${formatTokens(saved.squeeze)}, compaction ${formatTokens(saved.compaction)})`,
 			s ? `session cache: ${s.count} summaries, ${s.originalChars} -> ${s.summaryChars} chars, dir ${store?.dir}` : "",
 			`config: ${configPath()}`,
@@ -312,7 +373,8 @@ export default function (pi: ExtensionAPI) {
 			if (!compressorUsable(ctx)) {
 				ctx.ui.notify("pi-squeeze: compressor unavailable (off, not set, or same as chat model); using default compaction", "warning");
 			}
-			triggerCompact(ctx, "manual", (args ?? "").trim() || undefined);
+			await runCompact(ctx, "manual", (args ?? "").trim() || undefined);
+			updateStatus(ctx);
 		},
 	});
 

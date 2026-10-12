@@ -3,7 +3,7 @@ import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { compressorPrompt, compressorSystem, DEFAULT_CONFIG, estimateTokens, formatTokens, type MsgLike, SqueezeStore, shouldSqueezeFor, squeezeMessages, withRetry } from "../src/core.ts";
+import { compressorPrompt, compressorSystem, DEFAULT_CONFIG, estimateTokens, formatTokens, type MsgLike, SqueezeStore, shouldSqueezeFor, squeezeMessages, statusBarText, withRetry } from "../src/core.ts";
 
 const big = (tag: string) => `${tag} `.repeat(1000); // ~4000+ chars
 
@@ -118,6 +118,25 @@ test("shouldSqueezeFor", () => {
 	assert.equal(shouldSqueezeFor({ ...cfg, compressorModel: "" }, "big/opus"), false);
 	assert.equal(shouldSqueezeFor({ ...cfg, targetModels: ["big/*"] }, "big/opus"), true);
 	assert.equal(shouldSqueezeFor({ ...cfg, targetModels: ["big/*"] }, "other/x"), false);
+});
+
+test("statusBarText: empty when inactive, otherwise squeeze:<model> ▼<pct>% (<window>)", () => {
+	// Inactive (off, no compressor, active model is the compressor, or not a target): no text at all.
+	assert.equal(statusBarText({ ...cfg, enabled: false }, "big/opus", 80_000, 200_000), "");
+	assert.equal(statusBarText({ ...cfg, compressorModel: "" }, "big/opus", 80_000, 200_000), "");
+	assert.equal(statusBarText(cfg, "cheap/m", 80_000, 200_000), "");
+	assert.equal(statusBarText({ ...cfg, targetModels: ["big/*"] }, "other/x", 80_000, 200_000), "");
+	assert.equal(statusBarText(cfg, undefined, 80_000, 200_000), "");
+	// Active: model, percent of the context window, window size. No "tok saved".
+	assert.equal(statusBarText(cfg, "big/opus", 80_000, 200_000), "squeeze:m ▼40% (200k)");
+	// Multi-segment model ids: the label is the id's last segment.
+	const deepCfg = { ...cfg, compressorModel: "openrouter/deep/deepseek-chat" };
+	assert.equal(statusBarText(deepCfg, "big/opus", 850_000, 1_000_000), "squeeze:deepseek-chat ▼85% (1.00M)");
+	// Not yet measured: window without the percent.
+	assert.equal(statusBarText(cfg, "big/opus", null, 200_000), "squeeze:m (200k)");
+	assert.equal(statusBarText(cfg, "big/opus", null, undefined), "squeeze:m");
+	// Deferred compaction marker.
+	assert.equal(statusBarText(cfg, "big/opus", 170_000, 200_000, true), "squeeze:m ▼85% (200k) compact-next");
 });
 
 test("never touches user/assistant/system messages; protects first tool turn", async () => {
