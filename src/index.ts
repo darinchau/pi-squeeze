@@ -86,7 +86,7 @@ export default function (pi: ExtensionAPI) {
 
 	function updateStatus(ctx: ExtensionContext) {
 		if (!ctx.hasUI) return;
-		const text = statusBarText(config, modelKey(ctx.model), saved.squeeze + saved.compaction, ctx.model?.contextWindow, compactPending);
+		const text = statusBarText(config, modelKey(ctx.model), saved.squeeze + saved.compaction, ctx.model?.contextWindow, compactPending, lastPromptTokens);
 		// Empty text = squeezing inactive for the active model: clear the footer entry entirely.
 		ctx.ui.setStatus("pi-squeeze", text || undefined);
 	}

@@ -120,7 +120,7 @@ test("shouldSqueezeFor", () => {
 	assert.equal(shouldSqueezeFor({ ...cfg, targetModels: ["big/*"] }, "other/x"), false);
 });
 
-test("statusBarText: empty when inactive, otherwise squeeze:<model> ▼<saved> (<window>)", () => {
+test("statusBarText: empty when inactive, otherwise squeeze:<model> ▼<saved> (<current>/<window>)", () => {
 	// Inactive (off, no compressor, active model is the compressor, or not a target) with
 	// nothing armed: no text at all.
 	assert.equal(statusBarText({ ...cfg, enabled: false }, "big/opus", 27_000, 200_000), "");
@@ -133,7 +133,7 @@ test("statusBarText: empty when inactive, otherwise squeeze:<model> ▼<saved> (
 	assert.equal(statusBarText({ ...cfg, enabled: false }, "big/opus", 27_000, 200_000, true), "compact-next");
 	assert.equal(statusBarText({ ...cfg, compressorModel: "" }, "big/opus", 27_000, 200_000, true), "compact-next");
 	assert.equal(statusBarText({ ...cfg, targetModels: ["big/*"] }, "other/x", 0, undefined, true), "compact-next");
-	// Active: model, cumulative tokens saved (absolute), window size.
+	// Active: model, cumulative tokens saved (absolute), current/window size.
 	assert.equal(statusBarText(cfg, "big/opus", 13_000 + 14_000, 200_000), "squeeze:m ▼27k (200k)");
 	// Multi-segment model ids: the label is the id's last segment.
 	const deepCfg = { ...cfg, compressorModel: "openrouter/deep/deepseek-chat" };
@@ -141,8 +141,14 @@ test("statusBarText: empty when inactive, otherwise squeeze:<model> ▼<saved> (
 	// Nothing saved yet: window only.
 	assert.equal(statusBarText(cfg, "big/opus", 0, 200_000), "squeeze:m (200k)");
 	assert.equal(statusBarText(cfg, "big/opus", 0, undefined), "squeeze:m");
+	// Current prompt measured: (<current>/<window>). 0 counts as measured, not unknown.
+	assert.equal(statusBarText(cfg, "big/opus", 27_000, 200_000, false, 46_000), "squeeze:m ▼27k (46k/200k)");
+	assert.equal(statusBarText(cfg, "big/opus", 0, 200_000, false, 0), "squeeze:m (0/200k)");
+	// Window unknown: no parenthetical, even with a measurement (it would read as a bare window).
+	assert.equal(statusBarText(cfg, "big/opus", 27_000, undefined, false, 46_000), "squeeze:m ▼27k");
 	// Deferred compaction marker.
 	assert.equal(statusBarText(cfg, "big/opus", 27_000, 200_000, true), "squeeze:m ▼27k (200k) compact-next");
+	assert.equal(statusBarText(cfg, "big/opus", 27_000, 200_000, true, 46_000), "squeeze:m ▼27k (46k/200k) compact-next");
 });
 
 test("compactThresholdCrossed: global, only compactAtPercent gates it", () => {

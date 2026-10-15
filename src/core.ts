@@ -131,9 +131,12 @@ export function compactThresholdCrossed(
  * (extension off, compressor unset, active model is the compressor, or not a target)
  * and no deferred compaction is armed: the caller then clears its status entirely
  * instead of rendering text.
- * Active: `squeeze:<model> ▼<N> (<context window>)`, where N is the cumulative main-model
- * input tokens saved this session (summed per call), plus ` compact-next` when a deferred
+ * Active: `squeeze:<model> ▼<N> (<current>/<window>)`, where N is the cumulative main-model
+ * input tokens saved this session (summed per call) and <current> is the estimated prompt size
+ * after the latest squeeze (omitted until measured: then just `(<window>)`).
  * compaction is waiting for the next prompt.
+ * Squeezing inactive but a deferred compaction is armed: `compact-next` only — compaction
+ * ` compact-next` when a deferred compaction is waiting for the next prompt.
  * Squeezing inactive but a deferred compaction is armed: `compact-next` only — compaction
  * is global, so the marker shows even when nothing is being squeezed.
  */
@@ -143,11 +146,12 @@ export function statusBarText(
 	savedTokens: number,
 	contextWindow: number | undefined,
 	compactPending = false,
+	promptTokens: number | null = null,
 ): string {
 	if (!shouldSqueezeFor(config, activeModel)) return compactPending ? "compact-next" : "";
 	const parts = [`squeeze:${config.compressorModel.split("/").pop()}`];
 	if (savedTokens > 0) parts.push(`▼${formatTokens(savedTokens)}`);
-	if (contextWindow) parts.push(`(${formatTokens(contextWindow)})`);
+	if (contextWindow) parts.push(`(${promptTokens !== null ? `${formatTokens(promptTokens)}/` : ""}${formatTokens(contextWindow)})`);
 	if (compactPending) parts.push("compact-next");
 	return parts.join(" ");
 }
